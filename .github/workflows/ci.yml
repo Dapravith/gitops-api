@@ -1,12 +1,14 @@
 # CI for gitops-api: test -> scan -> build (multi-arch) -> publish immutable image
-# -> scan the published digest -> open a dev promotion PR in gitops-config.
+# -> scan the published digest -> sign build provenance.
+#
+# Promotion is PULL-based: gitops-config's image-updater workflow reads this
+# repo's main commit, its `image` job result and the signed attestation, then
+# opens the dev PR itself. This repo holds no credential for gitops-config.
 #
 # Security posture:
 # * every third-party action pinned by commit SHA (comment = release tag)
 # * scanners run as digest-pinned containers, not marketplace actions
 # * default token is read-only; each job asks only for what it needs
-# * the cross-repo credential (CONFIG_REPO_TOKEN, fine-grained PAT scoped to
-#   gitops-config) is only exposed to the final job on main
 # * no cluster credentials anywhere: Argo CD pulls from Git
 name: ci
 
@@ -129,61 +131,3 @@ jobs:
             echo "${IMAGE}@${{ steps.build.outputs.digest }}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-
-  promote-dev:
-    needs: image
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Check credential
-        id: cred
-        env:
-          TOKEN: ${{ secrets.CONFIG_REPO_TOKEN }}
-        run: |
-          if [ -z "$TOKEN" ]; then
-            echo "::warning::CONFIG_REPO_TOKEN not set; image published but no dev promotion PR opened"
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          fi
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: steps.cred.outputs.present == 'true'
-        with:
-          repository: Dapravith/gitops-config
-          token: ${{ secrets.CONFIG_REPO_TOKEN }}
-          path: gitops-config
-      - name: Open dev promotion PR
-        if: steps.cred.outputs.present == 'true'
-        working-directory: gitops-config
-        env:
-          GH_TOKEN: ${{ secrets.CONFIG_REPO_TOKEN }}
-          DIGEST: ${{ needs.image.outputs.digest }}
-          IMAGE_REGISTRY: ghcr.io
-          SHORT: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          short="${SHORT:0:7}"
-          branch="ci/dev-${short}"
-          git config user.name "gitops-api-ci"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -c "${branch}"
-          # Same script humans use: verifies the digest exists and is multi-arch.
-          scripts/set-image.sh dev "${DIGEST}"
-          if git diff --quiet; then echo "dev already on ${DIGEST}"; exit 0; fi
-          git commit -am "ci(dev): gitops-api@${DIGEST:0:19} built from gitops-api@${short}
-
-          Image: ghcr.io/dapravith/gitops-api@${DIGEST}
-          Source: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}
-          Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          git push origin "${branch}"
-          url="$(gh pr create --base main --head "${branch}" \
-            --title "ci(dev): gitops-api@${DIGEST:7:12} (${short})" \
-            --body "Automated dev promotion from ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}.
-
-          - Image: \`ghcr.io/dapravith/gitops-api@${DIGEST}\`
-          - Built from: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}
-          - Changes only \`apps/gitops-api/overlays/dev\`. Merges automatically once \`validate\` passes.")"
-          # dev is the only environment that merges without a human.
-          gh pr merge "${url}" --auto --merge
-          echo "Opened ${url}" >> "$GITHUB_STEP_SUMMARY"
